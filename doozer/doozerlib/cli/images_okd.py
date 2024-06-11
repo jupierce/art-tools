@@ -1,6 +1,8 @@
+import datetime
 import io
 import os
 import pathlib
+import time
 
 import click
 import yaml
@@ -534,6 +536,67 @@ def images_okg_check(runtime):
             print(f'{remaining_tag},{scos_status},{detail},{latest_pullspec}')
 
 
+@images_okd.command('mirror', short_help='Mirrors app.ci scos-4.x imagestream images (if they are CentOS) out to quay.io')
+@pass_runtime
+def images_streams_mirror(runtime):
+    runtime.initialize(clone_distgits=False, clone_source=False)
+    major = runtime.group_config.vars['MAJOR']
+    minor = runtime.group_config.vars['MINOR']
+    okd_version = f'{major}.{minor}'
+
+    payload_tag_names = set()
+    for image_meta in runtime.ordered_image_metas():
+        if get_needed_for_okd_payload_constructions(image_meta):
+            dest_pull_spec = resolve_okd_from_image_meta(runtime, image_meta, okd_version)
+            image_coordinate = convert_to_imagestream_coordinate(dest_pull_spec)
+            if image_coordinate.namespace == 'origin' and image_coordinate.name == f'scos-{okd_version}':
+                payload_tag_names.add(image_coordinate.tag)
+
+    with oc.project('origin'):
+        scos_imagestream = oc.selector(f'is/scos-{okd_version}').object()
+        print('TAG,SCOS,DETAIL,PULLSPEC')
+        for tag_entry in scos_imagestream.model.status.tags:
+            detail = ''
+            tag = tag_entry.tag
+            latest_pullspec = None
+            scos_status = "No"
+            do_mirror = False
+
+            if tag_entry.items:
+                latest_pullspec: str = tag_entry['items'][0].dockerImageReference
+                latest_pullspec = latest_pullspec.replace('image-registry.openshift-image-registry.svc:5000', 'registry.ci.openshift.org')
+
+            if tag == 'branding':
+                scos_status = "N/A"
+                detail = "branching is from scratch"
+                do_mirror = True
+            elif latest_pullspec:
+                temp_dir = tempfile.mkdtemp()
+                try:
+                    oc.invoke('image', cmd_args=['extract', f'--path=/etc/centos-release:{temp_dir}', latest_pullspec])
+                    if tag not in payload_tag_names:
+                        detail = 'not in ART built OKD tags'
+
+                    if os.path.exists(f'{temp_dir}/centos-release'):
+                        do_mirror = True
+                        scos_status = "Yes"
+                    else:
+                        if tag not in payload_tag_names:
+                            scos_status = "N/A?"
+
+                except:
+                    detail = 'error checking image'
+                shutil.rmtree(temp_dir)
+            else:
+                detail = 'does not have any items in its pullspec'
+
+            print(f'{tag},{scos_status},{detail},{latest_pullspec}')
+            if do_mirror:
+                suffix = latest_pullspec.split(':')[-1]
+                prevent_gc_tag = f'{time.time_ns()}_{suffix}'
+                exectools.cmd_assert(f'oc image mirror {latest_pullspec} quay.io/okd/scos-content:{prevent_gc_tag}')
+
+
 @prs.command('open', short_help='Open PRs against upstream component repos that have a FROM that differs from ART metadata.')
 @click.option('--github-access-token', metavar='TOKEN', required=True, help='Github access token for user.')
 @click.option('--okd-version', metavar='VERSION', required=True, help='Which OKD stream to promote to.')
@@ -553,10 +616,7 @@ def images_okd_prs(runtime, github_access_token, ignore_missing_images, okd_vers
     minor = runtime.group_config.vars['MINOR']
 
     master_major, master_minor = extract_version_fields(what_is_in_master(), at_least=2)
-    if major != master_major or minor != master_minor:
-        # These verbs should only be run against the version in master.
-        runtime.logger.warning(f'Target {major}.{minor} is not in master (it is tracking {master_major}.{master_minor}); skipping PRs')
-        exit(0)
+    is_in_master = major == master_major and minor == master_minor
 
     # Most OKD specific configuration is housed on github.com/openshift/release . It boils down
     # to generated ci-operator configuration files. We generate those configuration files
@@ -653,7 +713,7 @@ def images_okd_prs(runtime, github_access_token, ignore_missing_images, okd_vers
             # ci-operator configuration, even if it is not building anything, fails if there is no
             # build root. Just get the default golang.
             default_build_root = resolve_okd_from_entry(runtime, image_meta, Model({
-                'stream': 'golang'
+                'stream': 'rhel-9-golang'
             }), okd_version=okd_version)
             desired_ci_build_root_coordinate = convert_to_imagestream_coordinate(default_build_root)
 
@@ -678,7 +738,7 @@ def images_okd_prs(runtime, github_access_token, ignore_missing_images, okd_vers
         # openshift-4.x : Upstream team manages completely.
         # For the former style, we may need to open the PRs against the default branch (master or main).
         # For the latter style, always open directly against named branch
-        if public_branch.startswith('release-'):
+        if is_in_master and public_branch.startswith('release-'):
             public_branches, _ = exectools.cmd_assert(f'git ls-remote --heads {public_repo_url}', strip=True)
             public_branches = public_branches.splitlines()
             priv_branches, _ = exectools.cmd_assert(f'git ls-remote --heads {source_repo_url}', strip=True)
@@ -720,6 +780,13 @@ def images_okd_prs(runtime, github_access_token, ignore_missing_images, okd_vers
 
         dockerfile_abs_path = component_source_path.joinpath('Dockerfile')
         download_file_from_github(public_repo_url, public_branch, dockerfile_path, token=github_access_token, destination=dockerfile_abs_path)
+
+        with dockerfile_abs_path.open(mode='r') as handle:
+            lines = handle.read().strip().splitlines(keepends=False)
+
+        if len(lines) == 1 and ' ' not in lines[0]:
+            # This appears to be a symlink. github is returning a filename instead of something like "FROM scratch"
+            download_file_from_github(public_repo_url, public_branch, lines[0], token=github_access_token, destination=dockerfile_abs_path)
 
         with dockerfile_abs_path.open(mode='r') as handle:
             dfp = DockerfileParser(cache_content=True, fileobj=io.BytesIO())
@@ -765,7 +832,7 @@ def images_okd_prs(runtime, github_access_token, ignore_missing_images, okd_vers
         ci_operator_config.complete = True
 
     ci_operator_configs.write_configs(release_clone_dir)
-    print('It is necessary to run "make ci-operator-configs" and then "make jobs" on the generated release repository')
+    print('It is necessary to run "make ci-operator-config" and then "make jobs" on the generated release repository')
 
 
 @prs.command('set-optional-presubmit', short_help='Find OKD configs in MODIFIED openshift/release and set optional & always_run:false.')

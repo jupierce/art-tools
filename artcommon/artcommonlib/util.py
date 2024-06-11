@@ -77,6 +77,14 @@ def split_git_url(url) -> (str, str, str):
 
 
 def download_file_from_github(repository, branch, path, token: str, destination):
+    """
+    Downloads a file from githubusercontent from a particular org, repo, branch and path
+    to a specified local destination path.
+    Note that if the github file is a symlink, the destination file will be written with
+    the name of the file the symlink refers to. If you know the content is supposed to
+    be something specific, you can infer it is a symlink if the file contains a
+    single line of text and does not meet your expectations (e.g. not valid JSON).
+    """
     server, org, repo_name = split_git_url(repository)
     url = f'https://raw.githubusercontent.com/{org}/{repo_name}/{branch}/{path}'
     headers = {"Authorization": f"token {token}"}
