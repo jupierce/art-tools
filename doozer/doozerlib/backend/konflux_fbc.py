@@ -258,7 +258,6 @@ class KonfluxFbcFragmentMerger:
         registry_auth: Optional[str] = None,
         skip_checks: bool = False,
         plr_template: Optional[str] = None,
-        major_minor_override: Optional[Tuple[int, int]] = None,
         logger: logging.Logger | None = None,
     ):
         """
@@ -282,7 +281,6 @@ class KonfluxFbcFragmentMerger:
         self.registry_auth = registry_auth
         self.skip_checks = skip_checks
         self.plr_template = plr_template or constants.KONFLUX_DEFAULT_FBC_BUILD_PLR_TEMPLATE_URL
-        self.major_minor_override = major_minor_override
         self._logger = logger or LOGGER.getChild(self.__class__.__name__)
         self._konflux_client = KonfluxClient.from_kubeconfig(
             config_file=self.konflux_kubeconfig,
@@ -297,11 +295,8 @@ class KonfluxFbcFragmentMerger:
             raise ValueError("At least one fragment must be provided.")
         if not target_index:
             raise ValueError("Target index must be provided.")
-        if self.major_minor_override:
-            major, minor = self.major_minor_override
-        else:
-            major = int(self.group_config.get("vars", {}).get("MAJOR"))
-            minor = int(self.group_config.get("vars", {}).get("MINOR"))
+        major = int(self.group_config.get("vars", {}).get("MAJOR"))
+        minor = int(self.group_config.get("vars", {}).get("MINOR"))
         logger = self._logger
         konflux_client = self._konflux_client
 
@@ -553,7 +548,6 @@ class KonfluxFbcRebaser:
         push: bool,
         fbc_repo: str,
         upcycle: bool,
-        ocp_version_override: Optional[Tuple[int, int]] = None,
         record_logger: Optional[RecordLogger] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -566,7 +560,6 @@ class KonfluxFbcRebaser:
         self.push = push
         self.fbc_repo = fbc_repo or constants.ART_FBC_GIT_REPO
         self.upcycle = upcycle
-        self.ocp_version_override = ocp_version_override
         self._record_logger = record_logger
         self._logger = logger or LOGGER.getChild(self.__class__.__name__)
 
@@ -660,10 +653,7 @@ class KonfluxFbcRebaser:
         logger.info("Rebasing dir %s", build_repo.local_dir)
 
         group_config = metadata.runtime.group_config
-        if self.ocp_version_override:
-            ocp_version = self.ocp_version_override
-        else:
-            ocp_version = int(group_config.vars.MAJOR), int(group_config.vars.MINOR)
+        ocp_version = int(group_config.vars.MAJOR), int(group_config.vars.MINOR)
         # OCP 4.17+ requires bundle object to CSV metadata migration.
         migrate_level = "none"
         if ocp_version >= (4, 17):
@@ -744,18 +734,6 @@ class KonfluxFbcRebaser:
                 skips = set(bundle_with_skips.pop('skips'))
                 skips = (skips | {bundle_with_skips['name']}) - {olm_bundle_name}
 
-            # For an operator bundle that uses replaces -- such as OADP
-            # Update "replaces" in the channel
-            replaces = None
-            if 'oadp-' in olm_bundle_name:
-                # Find the current head - the entry that is not replaced by any other entry
-                bundle_with_replaces = [it for it in channel['entries']]
-                replaced_names = {it.get('replaces') for it in bundle_with_replaces if it.get('replaces')}
-                current_head = next((it for it in bundle_with_replaces if it['name'] not in replaced_names), None)
-                if current_head:
-                    # The new bundle should replace the current head
-                    replaces = current_head['name']
-
             # Add the current bundle to the specified channel in the catalog
             entry = next((entry for entry in channel['entries'] if entry['name'] == olm_bundle_name), None)
             if not entry:
@@ -770,8 +748,6 @@ class KonfluxFbcRebaser:
                 entry["skipRange"] = olm_skip_range
             if skips:
                 entry["skips"] = sorted(skips)
-            if replaces:
-                entry["replaces"] = replaces
 
         for channel_name in channel_names:
             logger.info("Updating channel %s", channel_name)
@@ -906,15 +882,12 @@ class KonfluxFbcRebaser:
         ]
 
     def _generate_image_digest_mirror_set(self, olm_bundle_blobs: Iterable[Dict], ref_pullspecs: Iterable[str]):
-        dest_repos = {}
-        for bundle_blob in olm_bundle_blobs:
-            for related_image in bundle_blob.get("relatedImages", []):
-                if '@' in related_image["image"]:
-                    repo, digest = related_image["image"].split('@', 1)
-                    dest_repos[digest] = repo
-                else:
-                    # Skip is non-OCP operator
-                    continue
+        dest_repos = {
+            p_split[1]: p_split[0]
+            for bundle_blob in olm_bundle_blobs
+            for related_image in bundle_blob.get("relatedImages", [])
+            if (p_split := related_image["image"].split('@', 1))
+        }
         source_repos = {p_split[1]: p_split[0] for pullspec in ref_pullspecs if (p_split := pullspec.split('@', 1))}
         if not dest_repos:
             return None
@@ -933,9 +906,7 @@ class KonfluxFbcRebaser:
                             source_repo,
                         ],
                     }
-                    # If source is same as destination, we don't need to add an IDMS mapping
                     for sha, source_repo in source_repos.items()
-                    if sha in dest_repos and source_repo != dest_repos[sha]
                 ],
             },
         }
