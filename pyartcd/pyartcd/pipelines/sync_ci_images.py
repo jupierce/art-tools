@@ -541,7 +541,9 @@ class SyncCIImagesPipeline:
         # Pass --registry-auth for image info and mirror operations in pre-build steps
         start_builds_args = f"--registry-auth {auth_file} "
         if self.runtime.dry_run:
-            start_builds_args += "--dry-run"
+            start_builds_args += "--dry-run "
+        if self.skip_waits:
+            start_builds_args += "--skip-post-build-wait "
         await self._run_doozer_command(doozer_opts, "images:streams start-builds", start_builds_args.strip())
 
     async def _wait_for_builds(self) -> None:

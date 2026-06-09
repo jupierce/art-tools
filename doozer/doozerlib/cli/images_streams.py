@@ -617,9 +617,17 @@ def get_eligible_buildconfigs(runtime, streams, live_test_mode):
 )
 @click.option('--live-test-mode', default=False, is_flag=True, help='Act on live-test mode buildconfigs')
 @click.option('--dry-run', default=False, is_flag=True, help='Do not build anything, but only print build operations.')
+@click.option(
+    '--skip-post-build-wait',
+    default=False,
+    is_flag=True,
+    help='Skip waiting for builds to complete and post-build preservation',
+)
 @option_registry_auth
 @pass_runtime
-def images_streams_start_buildconfigs(runtime, streams, as_user, live_test_mode, dry_run, registry_auth: Optional[str]):
+def images_streams_start_buildconfigs(
+    runtime, streams, as_user, live_test_mode, dry_run, skip_post_build_wait, registry_auth: Optional[str]
+):
     runtime.initialize(clone_distgits=False, clone_source=False, prevent_cloning=True)
 
     # Determine which registry config to use
@@ -905,7 +913,7 @@ def images_streams_start_buildconfigs(runtime, streams, as_user, live_test_mode,
             triggered_builds.append((bc_name, qci_pullspec, dest_ns, dest_imagestream, dest_tag))
 
     # Post-build preservation: wait for builds and preserve newly built images
-    if triggered_builds and not dry_run:
+    if triggered_builds and not dry_run and not skip_post_build_wait:
         print('\n=== Post-Build Preservation ===')
         print(f'Waiting for {len(triggered_builds)} builds to complete...')
 
